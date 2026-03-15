@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3002;
 
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', credentials: true }));
 app.use(express.json());
+app.use(express.static('public'));
 
 // Rutas REST
 app.use('/api/auth',    require('./routes/auth'));
