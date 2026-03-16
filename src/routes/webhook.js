@@ -101,9 +101,9 @@ async function handleIncomingMessage(message, contact) {
     // ── Crear nueva conversación ───────────────────────────────────
     const welcome = settings?.welcome_message || '¡Hola! ¿En qué puedo ayudarte?';
 
-    // Auto-vincular si el teléfono ya corresponde a un cliente registrado
+    // Auto-vincular solo si el teléfono corresponde a un cliente con CUIT registrado
     const existingClient = db.prepare(
-      'SELECT id, name FROM clients WHERE phone = ? AND active = 1 LIMIT 1'
+      "SELECT id, name FROM clients WHERE phone = ? AND active = 1 AND tax_id IS NOT NULL AND tax_id != '' LIMIT 1"
     ).get(phoneNumber);
 
     const result = db.prepare(`

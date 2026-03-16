@@ -10,14 +10,16 @@ function isApiConfigured() {
 
 // ── Contexto del cliente ───────────────────────────────────────────────────────
 // Devuelve { identified, client } y auto-vincula si el teléfono ya está en la DB.
+// Un cliente se considera "identificado" SOLO si tiene CUIT (tax_id) registrado.
 function getClientContext(conv) {
   if (conv.client_id) {
     const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(conv.client_id);
-    if (client) return { identified: true, client };
+    if (client && client.tax_id) return { identified: true, client };
+    // Tiene cliente vinculado pero sin CUIT — no es identificación válida
   }
   if (conv.phone_number) {
     const client = db.prepare(
-      'SELECT * FROM clients WHERE phone = ? AND active = 1 LIMIT 1'
+      "SELECT * FROM clients WHERE phone = ? AND active = 1 AND tax_id IS NOT NULL AND tax_id != '' LIMIT 1"
     ).get(conv.phone_number);
     if (client) {
       db.prepare('UPDATE ai_conversations SET client_id = ?, client_name = ? WHERE id = ?')
