@@ -184,6 +184,12 @@ function initDatabase() {
     console.log('✓ Migración: ai_conversations.phone_number agregado');
   }
 
+  // ── Migración: urgent en ai_conversations ─────────────────────────────────
+  if (!convCols.some(c => c.name === 'urgent')) {
+    db.exec('ALTER TABLE ai_conversations ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0');
+    console.log('✓ Migración: ai_conversations.urgent agregado');
+  }
+
   // Seed: configuración de IA por defecto
   const defaultHours = JSON.stringify({
     mon: { e: 1, o: '09:00', c: '18:00' }, tue: { e: 1, o: '09:00', c: '18:00' },

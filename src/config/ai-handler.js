@@ -101,6 +101,18 @@ function crearCliente(conv, { name, tax_id, phone, email, address }) {
   return client;
 }
 
+// ── Calcular fecha mínima de entrega (48 horas desde ahora) ─────────────────
+function getDeliveryInfo() {
+  const DAYS_ES = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+  const now     = new Date();
+  const minDate = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  return {
+    today:      DAYS_ES[now.getDay()],
+    minDay:     DAYS_ES[minDate.getDay()],
+    minDateStr: minDate.toISOString().split('T')[0], // YYYY-MM-DD
+  };
+}
+
 // ── System prompt ─────────────────────────────────────────────────────────────
 function buildSystemPrompt(settings, products, clientContext) {
   const catalog = products.length
@@ -130,6 +142,8 @@ Ejemplo: "Para registrar tu pedido necesito identificarte. ¿Me podés dar tu CU
 Usá la herramienta buscar_cliente cuando te lo dé.`;
   }
 
+  const { today, minDay, minDateStr } = getDeliveryInfo();
+
   return `Sos ${settings.assistant_name || 'el asistente de OrderFlow'}, asistente de ventas de un centro de producción.
 
 ${baseInstructions}
@@ -156,15 +170,25 @@ ${catalog}
 ▶ PASO 2 — TOMAR EL PEDIDO (solo si cliente identificado):
   a) Mostrá el catálogo con precios.
   b) Recibí los productos y cantidades.
-  c) Preguntá si tiene fecha de entrega requerida (es opcional).
-  d) Mostrá el resumen: ítems, subtotales y total general.
-  e) Pedí confirmación explícita ("sí", "dale", "confirmado", etc.).
-  f) Solo entonces llamá create_order.
+  c) Mostrá el resumen: ítems, subtotales y total general.
+  d) ANTES de confirmar, pedí la fecha de entrega (es OBLIGATORIA).
+     Indicá que el tiempo mínimo de entrega es 48 horas.
+     Ejemplo actual: "Si lo pedís hoy (${today}), te lo entregamos el ${minDay} como mínimo (en 48 hs)."
+     La fecha mínima aceptable es: ${minDateStr}.
+  e) Validá la fecha pedida:
+     - Si la fecha es >= ${minDateStr}: perfecto, pedí confirmación explícita y llamá create_order.
+     - Si la fecha es < ${minDateStr} (menos de 48 hs):
+       1. Informale: "El tiempo mínimo de entrega es 48 hs."
+       2. Preguntale si igual necesita la entrega para esa fecha urgente.
+       3. Si confirma que sí la necesita urgente → llamá escalar_a_humano y decile:
+          "Entendido. Un miembro de nuestro equipo se va a comunicar a la brevedad para coordinar tu entrega urgente."
+  f) Solo después de validar la fecha, llamá create_order (solo si fecha >= ${minDateStr}).
 
 ▶ REGLAS:
   - Respondé siempre en español, de forma amable y breve.
   - Usá exactamente los IDs del catálogo al crear el pedido.
-  - El pedido queda registrado automáticamente a nombre del cliente identificado.`;
+  - El pedido queda registrado automáticamente a nombre del cliente identificado.
+  - Nunca registres un pedido con fecha de entrega menor a 48 hs; usá escalar_a_humano en ese caso.`;
 }
 
 // ── Herramientas disponibles para Claude ─────────────────────────────────────
@@ -212,6 +236,21 @@ const TOOLS = [
         address: { type: 'string', description: 'Dirección (opcional)' },
       },
       required: ['name', 'tax_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'escalar_a_humano',
+    description: 'Escala la conversación a un operador humano urgente. Usá esta herramienta SOLO cuando el cliente necesita entrega en menos de 48 horas y confirma que necesita esa fecha.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        motivo: {
+          type: 'string',
+          description: 'Motivo de la escalada (ej: "Cliente solicita entrega urgente para 2026-03-17, menos de 48h")',
+        },
+      },
+      required: ['motivo'],
       additionalProperties: false,
     },
   },
@@ -283,6 +322,17 @@ function createOrderFromAI(conv, { items, delivery_date, notes }, productsMap) {
       subtotal: productsMap[i.product_id].base_price * i.quantity,
     })),
   };
+}
+
+// ── Escalar conversación a humano urgente ─────────────────────────────────────
+function escalarAHumano(conv, motivo) {
+  db.prepare(
+    'UPDATE ai_conversations SET ai_active = 0, urgent = 1 WHERE id = ?'
+  ).run(conv.id);
+  console.log(`[AI] Conv #${conv.id} escalada a humano — motivo: ${motivo}`);
+  const updated = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(conv.id);
+  broadcast({ type: 'conversation_updated', conversation: updated });
+  return updated;
 }
 
 // ── Procesamiento principal ───────────────────────────────────────────────────
@@ -391,6 +441,19 @@ async function processAIResponse(convId) {
           toolResults.push({
             type: 'tool_result', tool_use_id: block.id,
             content: `✅ Cliente creado: ${client.name} (CUIT: ${client.tax_id}, ID: ${client.id}). Podés continuar con el pedido.`,
+          });
+        } catch (err) {
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true });
+        }
+      }
+
+      else if (block.name === 'escalar_a_humano') {
+        try {
+          escalarAHumano(conv, block.input.motivo);
+          conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
+          toolResults.push({
+            type: 'tool_result', tool_use_id: block.id,
+            content: `✅ Conversación marcada como urgente. Motivo: ${block.input.motivo}. Un operador humano recibirá la alerta y se comunicará a la brevedad.`,
           });
         } catch (err) {
           toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true });
