@@ -8,65 +8,260 @@ function isApiConfigured() {
   return !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'TU_API_KEY_AQUI';
 }
 
-function buildSystemPrompt(settings, products) {
+// ── Contexto del cliente ───────────────────────────────────────────────────────
+// Devuelve { identified, client } y auto-vincula si el teléfono ya está en la DB.
+function getClientContext(conv) {
+  if (conv.client_id) {
+    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(conv.client_id);
+    if (client) return { identified: true, client };
+  }
+  if (conv.phone_number) {
+    const client = db.prepare(
+      'SELECT * FROM clients WHERE phone = ? AND active = 1 LIMIT 1'
+    ).get(conv.phone_number);
+    if (client) {
+      db.prepare('UPDATE ai_conversations SET client_id = ?, client_name = ? WHERE id = ?')
+        .run(client.id, client.name, conv.id);
+      return { identified: true, client };
+    }
+  }
+  return { identified: false, client: null };
+}
+
+// ── Buscar cliente por CUIT o nombre ─────────────────────────────────────────
+function buscarCliente(query) {
+  const q = (query || '').trim();
+  const cleanCuit = q.replace(/[-.\s]/g, '');
+
+  // 1. Por CUIT exacto (ignorando guiones y espacios)
+  if (cleanCuit.length >= 10) {
+    const byCuit = db.prepare(
+      "SELECT * FROM clients WHERE active = 1 AND replace(replace(replace(COALESCE(tax_id,''),'-',''),' ',''),'.','') = ? LIMIT 1"
+    ).get(cleanCuit);
+    if (byCuit) return { found: true, exact: true, clients: [byCuit] };
+  }
+
+  // 2. Por nombre exacto (sin distinción de mayúsculas)
+  const byExact = db.prepare(
+    "SELECT * FROM clients WHERE active = 1 AND lower(name) = lower(?) LIMIT 1"
+  ).get(q);
+  if (byExact) return { found: true, exact: true, clients: [byExact] };
+
+  // 3. Por nombre parcial (hasta 5 resultados)
+  const byPartial = db.prepare(
+    `SELECT * FROM clients WHERE active = 1
+     AND (lower(name) LIKE lower(?) OR lower(COALESCE(business_name,'')) LIKE lower(?))
+     ORDER BY name ASC LIMIT 5`
+  ).all(`%${q}%`, `%${q}%`);
+  if (byPartial.length > 0) return { found: true, exact: false, clients: byPartial };
+
+  return { found: false, clients: [] };
+}
+
+// ── Confirmar cliente existente y vincularlo a la conversación ────────────────
+function confirmarCliente(conv, clientId) {
+  const client = db.prepare('SELECT * FROM clients WHERE id = ? AND active = 1').get(clientId);
+  if (!client) throw new Error(`No se encontró el cliente con ID ${clientId}`);
+  db.prepare('UPDATE ai_conversations SET client_id = ?, client_name = ? WHERE id = ?')
+    .run(client.id, client.name, conv.id);
+  // Vincular teléfono si no lo tenía
+  if (conv.phone_number && !client.phone) {
+    db.prepare('UPDATE clients SET phone = ? WHERE id = ?').run(conv.phone_number, client.id);
+  }
+  console.log(`[AI] Cliente confirmado: "${client.name}" (ID: ${client.id})`);
+  return client;
+}
+
+// ── Crear cliente nuevo y vincularlo a la conversación ───────────────────────
+function crearCliente(conv, { name, tax_id, phone, email, address }) {
+  if (!name?.trim()) throw new Error('La razón social es requerida');
+  if (!tax_id?.trim()) throw new Error('El CUIT es requerido');
+
+  const cleanCuit = tax_id.replace(/[-.\s]/g, '');
+  const dup = db.prepare(
+    "SELECT id, name FROM clients WHERE active = 1 AND replace(replace(replace(COALESCE(tax_id,''),'-',''),' ',''),'.','') = ?"
+  ).get(cleanCuit);
+  if (dup) throw new Error(`Ya existe un cliente con ese CUIT: ${dup.name} (ID: ${dup.id})`);
+
+  const res = db.prepare(
+    'INSERT INTO clients (name, business_name, tax_id, phone, email, address, active) VALUES (?, ?, ?, ?, ?, ?, 1)'
+  ).run(
+    name.trim(), name.trim(), tax_id.trim(),
+    phone?.trim() || conv.phone_number || null,
+    email?.trim() || null,
+    address?.trim() || null
+  );
+
+  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(res.lastInsertRowid);
+  db.prepare('UPDATE ai_conversations SET client_id = ?, client_name = ? WHERE id = ?')
+    .run(client.id, client.name, conv.id);
+  console.log(`[AI] Cliente creado: "${client.name}" CUIT: ${client.tax_id} (ID: ${client.id})`);
+  return client;
+}
+
+// ── System prompt ─────────────────────────────────────────────────────────────
+function buildSystemPrompt(settings, products, clientContext) {
   const catalog = products.length
     ? products.map(p =>
         `  • [ID:${p.id}] ${p.name} — $${p.base_price}/${p.unit} (código: ${p.code})`
       ).join('\n')
     : '  (Sin productos disponibles)';
 
-  return `Sos ${settings.assistant_name || 'el asistente de OrderFlow'}, un asistente de ventas de un centro de producción.
+  const baseInstructions = settings.special_instructions ||
+    'Sos un asistente amable de un centro de producción. Ayudás a los clientes a hacer pedidos, consultar precios y resolver dudas. Respondé siempre en español.';
 
-${settings.special_instructions || 'Ayudás a los clientes a hacer pedidos, consultar precios y resolver dudas. Respondé siempre en español.'}
+  let clientSection;
+  if (clientContext.identified && clientContext.client) {
+    const c = clientContext.client;
+    clientSection = `== CLIENTE IDENTIFICADO ✅ ==
+Razón social : ${c.name}
+CUIT         : ${c.tax_id || '(no registrado)'}
+Teléfono     : ${c.phone  || '(no registrado)'}
+Email        : ${c.email  || '(no registrado)'}
+ID interno   : ${c.id}
+→ Podés mostrar el catálogo y tomar pedidos directamente.`;
+  } else {
+    clientSection = `== CLIENTE NO IDENTIFICADO ⚠️ ==
+INSTRUCCIÓN CRÍTICA: El cliente NO está identificado en el sistema.
+ANTES de mostrar el catálogo o tomar cualquier pedido, DEBÉS pedirle su CUIT o razón social.
+Ejemplo: "Para registrar tu pedido necesito identificarte. ¿Me podés dar tu CUIT o razón social?"
+Usá la herramienta buscar_cliente cuando te lo dé.`;
+  }
+
+  return `Sos ${settings.assistant_name || 'el asistente de OrderFlow'}, asistente de ventas de un centro de producción.
+
+${baseInstructions}
+
+${clientSection}
 
 == CATÁLOGO DE PRODUCTOS ==
 ${catalog}
 
-== INSTRUCCIONES ==
-- Cuando el cliente quiera hacer un pedido, listá los productos y cantidades con sus precios unitarios y el total antes de confirmar.
-- Solo creá el pedido cuando el cliente lo confirme explícitamente ("sí", "confirmado", "dale", etc.).
-- Al crear el pedido, usá exactamente los IDs del catálogo.
-- Respondé siempre de forma amable, breve y en español.`;
+== FLUJO DE ATENCIÓN ==
+
+▶ PASO 1 — IDENTIFICAR AL CLIENTE (obligatorio si no está identificado):
+  a) Pedí CUIT o razón social.
+  b) Llamá buscar_cliente con lo que te dieron.
+  c) Si encontró coincidencia exacta → mostrá los datos al cliente y pedí confirmación.
+     Cuando el cliente confirme → llamá confirmar_cliente con su ID.
+  d) Si encontró varias coincidencias → mostrá la lista y preguntá cuál es.
+     Cuando el cliente elija → llamá confirmar_cliente con ese ID.
+  e) Si no encontró nada → informalo y pedí los datos completos:
+     razón social, CUIT, teléfono y email (dirección es opcional).
+     Con esos datos → llamá crear_cliente.
+  f) Una vez confirmado/creado → continuá al Paso 2.
+
+▶ PASO 2 — TOMAR EL PEDIDO (solo si cliente identificado):
+  a) Mostrá el catálogo con precios.
+  b) Recibí los productos y cantidades.
+  c) Preguntá si tiene fecha de entrega requerida (es opcional).
+  d) Mostrá el resumen: ítems, subtotales y total general.
+  e) Pedí confirmación explícita ("sí", "dale", "confirmado", etc.).
+  f) Solo entonces llamá create_order.
+
+▶ REGLAS:
+  - Respondé siempre en español, de forma amable y breve.
+  - Usá exactamente los IDs del catálogo al crear el pedido.
+  - El pedido queda registrado automáticamente a nombre del cliente identificado.`;
 }
 
-// Obtiene o crea un cliente en la base de datos para asociar al pedido
-function getOrCreateClientId(conv) {
-  if (conv.phone_number) {
-    const existing = db.prepare('SELECT id FROM clients WHERE phone = ?').get(conv.phone_number);
-    if (existing) return existing.id;
-    const r = db.prepare('INSERT INTO clients (name, phone, active) VALUES (?, ?, 1)')
-      .run(conv.client_name || `+${conv.phone_number}`, conv.phone_number);
-    return r.lastInsertRowid;
-  }
-  // Canal web sin teléfono: crea cliente temporal si no existe
-  const r = db.prepare('INSERT INTO clients (name, active) VALUES (?, 1)')
-    .run(conv.client_name || 'Cliente IA');
-  return r.lastInsertRowid;
-}
+// ── Herramientas disponibles para Claude ─────────────────────────────────────
+const TOOLS = [
+  {
+    name: 'buscar_cliente',
+    description: 'Busca un cliente en el sistema por CUIT o nombre/razón social. Llamá esta herramienta cuando el cliente te dé su CUIT o nombre para identificarse.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        cuit_o_nombre: {
+          type: 'string',
+          description: 'CUIT (ej: 20-12345678-9 o 20123456789) o nombre/razón social a buscar',
+        },
+      },
+      required: ['cuit_o_nombre'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'confirmar_cliente',
+    description: 'Vincula un cliente existente a esta conversación. Llamá esta herramienta SOLO después de que el cliente confirmó que los datos mostrados son correctos.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        client_id: {
+          type: 'integer',
+          description: 'ID del cliente a confirmar (obtenido del resultado de buscar_cliente)',
+        },
+      },
+      required: ['client_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'crear_cliente',
+    description: 'Crea un nuevo cliente en el sistema. Usá esta herramienta cuando el cliente no existe y ya tenés todos sus datos (razón social y CUIT son obligatorios).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name:    { type: 'string', description: 'Razón social o nombre completo' },
+        tax_id:  { type: 'string', description: 'CUIT (ej: 20-12345678-9)' },
+        phone:   { type: 'string', description: 'Teléfono de contacto (opcional)' },
+        email:   { type: 'string', description: 'Email de contacto (opcional)' },
+        address: { type: 'string', description: 'Dirección (opcional)' },
+      },
+      required: ['name', 'tax_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'create_order',
+    description: 'Registra un pedido confirmado por el cliente. SOLO llamar cuando: (1) el cliente está identificado, y (2) el cliente confirmó el pedido explícitamente.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        items: {
+          type: 'array',
+          description: 'Lista de productos y cantidades',
+          items: {
+            type: 'object',
+            properties: {
+              product_id: { type: 'integer', description: 'ID del producto según catálogo' },
+              quantity:   { type: 'number',  description: 'Cantidad pedida' },
+            },
+            required: ['product_id', 'quantity'],
+            additionalProperties: false,
+          },
+        },
+        delivery_date: { type: 'string', description: 'Fecha de entrega YYYY-MM-DD (opcional)' },
+        notes:         { type: 'string', description: 'Observaciones del pedido (opcional)' },
+      },
+      required: ['items'],
+      additionalProperties: false,
+    },
+  },
+];
 
-function createOrderFromAI(conv, { items }, productsMap) {
+// ── Crear pedido ──────────────────────────────────────────────────────────────
+function createOrderFromAI(conv, { items, delivery_date, notes }, productsMap) {
   const validItems = (items || []).filter(i => productsMap[i.product_id] && i.quantity > 0);
   if (!validItems.length) throw new Error('No hay ítems válidos en el pedido');
+  if (!conv.client_id) throw new Error('El cliente no está identificado. Identificalo antes de crear el pedido.');
 
-  const clientId  = getOrCreateClientId(conv);
-  const adminOp   = db.prepare("SELECT id FROM operators WHERE role = 'admin' LIMIT 1").get();
+  const adminOp    = db.prepare("SELECT id FROM operators WHERE role = 'admin' LIMIT 1").get();
   const operatorId = adminOp?.id || 1;
-
-  // Número de pedido único basado en timestamp
   const orderNumber = `ORD-${Date.now().toString().slice(-7)}`;
-  const total = validItems.reduce((sum, i) => sum + productsMap[i.product_id].base_price * i.quantity, 0);
+  const total = validItems.reduce(
+    (sum, i) => sum + productsMap[i.product_id].base_price * i.quantity, 0
+  );
+  const orderNotes = [notes || null, `Pedido tomado por IA (canal: ${conv.channel})`]
+    .filter(Boolean).join(' — ');
 
   const orderRes = db.prepare(`
-    INSERT INTO orders (order_number, client_id, operator_id, status, notes, total)
-    VALUES (?, ?, ?, 'pending', ?, ?)
-  `).run(
-    orderNumber, clientId, operatorId,
-    `Pedido tomado por IA (canal: ${conv.channel})`,
-    total
-  );
+    INSERT INTO orders (order_number, client_id, operator_id, status, notes, delivery_date, total)
+    VALUES (?, ?, ?, 'pending', ?, ?, ?)
+  `).run(orderNumber, conv.client_id, operatorId, orderNotes, delivery_date || null, total);
 
   const orderId = orderRes.lastInsertRowid;
-
   for (const item of validItems) {
     const p = productsMap[item.product_id];
     db.prepare(`
@@ -75,56 +270,41 @@ function createOrderFromAI(conv, { items }, productsMap) {
     `).run(orderId, item.product_id, item.quantity, p.base_price, p.base_price * item.quantity);
   }
 
+  const client = db.prepare('SELECT name FROM clients WHERE id = ?').get(conv.client_id);
   return {
-    orderId,
-    orderNumber,
-    total,
+    orderId, orderNumber, total,
+    clientName: client?.name || 'Cliente',
     lines: validItems.map(i => ({
-      qty: i.quantity,
-      unit: productsMap[i.product_id].unit,
-      name: productsMap[i.product_id].name,
+      qty:      i.quantity,
+      unit:     productsMap[i.product_id].unit,
+      name:     productsMap[i.product_id].name,
       subtotal: productsMap[i.product_id].base_price * i.quantity,
     })),
   };
 }
 
+// ── Procesamiento principal ───────────────────────────────────────────────────
 async function processAIResponse(convId) {
-  console.log(`[AI] processAIResponse iniciado para conv #${convId}`);
+  console.log(`[AI] processAIResponse conv #${convId}`);
 
-  // ── Verificaciones previas ────────────────────────────────────────────────
-  const keyPresent = !!process.env.ANTHROPIC_API_KEY;
-  const keyValid   = isApiConfigured();
-  console.log(`[AI] API key presente: ${keyPresent}, válida: ${keyValid}`);
-
-  if (!keyValid) {
-    console.warn('[AI] ANTHROPIC_API_KEY no configurada o con valor placeholder — respuesta IA omitida');
+  if (!isApiConfigured()) {
+    console.warn('[AI] ANTHROPIC_API_KEY no configurada — saltando');
     return;
   }
 
-  const conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
-  console.log(`[AI] Conv encontrada: ${!!conv}, ai_active: ${conv?.ai_active}, status: ${conv?.status}`);
-  if (!conv || !conv.ai_active || conv.status !== 'active') {
-    console.warn(`[AI] Conv #${convId} no cumple condiciones para respuesta IA — saltando`);
-    return;
-  }
+  let conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
+  if (!conv || !conv.ai_active || conv.status !== 'active') return;
 
   const settings = db.prepare('SELECT * FROM ai_settings WHERE id = 1').get();
-  console.log(`[AI] ai_enabled: ${settings?.ai_enabled}`);
-  if (!settings?.ai_enabled) {
-    console.warn('[AI] IA deshabilitada en configuración — saltando');
-    return;
-  }
+  if (!settings?.ai_enabled) return;
 
-  // ── Datos para el contexto ────────────────────────────────────────────────
   const products    = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY name ASC').all();
   const productsMap = Object.fromEntries(products.map(p => [p.id, p]));
 
-  // Historial de mensajes: convertir roles al formato user/assistant de Claude
   const rawHistory = db.prepare(
     'SELECT * FROM ai_messages WHERE conversation_id = ? ORDER BY created_at ASC'
   ).all(convId);
 
-  // Omitir mensajes de asistente al inicio (bienvenida) y mapear operator → assistant
   const claudeMsgs = [];
   for (const msg of rawHistory) {
     const role = msg.role === 'user' ? 'user' : 'assistant';
@@ -132,119 +312,110 @@ async function processAIResponse(convId) {
     claudeMsgs.push({ role, content: msg.content });
   }
 
-  console.log(`[AI] Historial raw: ${rawHistory.length} mensajes, Claude msgs: ${claudeMsgs.length}`);
-  if (claudeMsgs.length) {
-    console.log(`[AI] Último mensaje rol: ${claudeMsgs[claudeMsgs.length - 1].role}`);
-  }
+  if (!claudeMsgs.length || claudeMsgs[claudeMsgs.length - 1].role !== 'user') return;
 
-  // Si el último mensaje no es del usuario, no hay nada que responder
-  if (!claudeMsgs.length || claudeMsgs[claudeMsgs.length - 1].role !== 'user') {
-    console.warn('[AI] Sin mensaje de usuario al final del historial — saltando');
-    return;
-  }
+  const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  let messages     = [...claudeMsgs];
+  let responseText = null;
+  let orderData    = null;
 
-  // ── Definición de herramienta ─────────────────────────────────────────────
-  const tools = [{
-    name: 'create_order',
-    description: 'Registra en el sistema un pedido confirmado por el cliente. Llamá esta herramienta SOLO cuando el cliente confirme explícitamente el pedido.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        items: {
-          type: 'array',
-          description: 'Lista de productos y cantidades del pedido',
-          items: {
-            type: 'object',
-            properties: {
-              product_id: { type: 'integer', description: 'ID del producto según el catálogo' },
-              quantity:   { type: 'number',  description: 'Cantidad pedida' },
-            },
-            required: ['product_id', 'quantity'],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ['items'],
-      additionalProperties: false,
-    },
-  }];
+  for (let iter = 0; iter < 6; iter++) {
+    conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
+    const clientContext = getClientContext(conv);
+    const systemPrompt  = buildSystemPrompt(settings, products, clientContext);
 
-  const client     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const systemPrompt = buildSystemPrompt(settings, products);
-  let messages       = [...claudeMsgs];
-  let responseText   = null;
-  let orderData      = null;
+    console.log(`[AI] Iter ${iter + 1} — cliente: ${clientContext.identified ? clientContext.client?.name : 'no identificado'}`);
 
-  console.log(`[AI] Llamando Claude con ${claudeMsgs.length} msgs, ${products.length} productos`);
-
-  try {
-    // ── Primera llamada a Claude ──────────────────────────────────────────
-    const response = await client.messages.create({
+    const response = await anthropic.messages.create({
       model:       'claude-opus-4-6',
       max_tokens:  1024,
       system:      systemPrompt,
       messages,
-      tools,
+      tools:       TOOLS,
       tool_choice: { type: 'auto' },
     });
 
-    console.log(`[AI] Respuesta Claude — stop_reason: ${response.stop_reason}, bloques: ${response.content.length}`);
+    console.log(`[AI] stop_reason: ${response.stop_reason}`);
 
-    if (response.stop_reason === 'tool_use') {
-      // ── Ejecutar herramienta y hacer llamada de seguimiento ────────────
-      messages = [...messages, { role: 'assistant', content: response.content }];
-
-      const toolResults = [];
+    if (response.stop_reason !== 'tool_use') {
       for (const block of response.content) {
-        if (block.type !== 'tool_use' || block.name !== 'create_order') continue;
+        if (block.type === 'text') { responseText = block.text; break; }
+      }
+      break;
+    }
+
+    messages = [...messages, { role: 'assistant', content: response.content }];
+    const toolResults = [];
+
+    for (const block of response.content) {
+      if (block.type !== 'tool_use') continue;
+
+      if (block.name === 'buscar_cliente') {
+        const result = buscarCliente(block.input.cuit_o_nombre);
+        let content;
+        if (!result.found) {
+          content = `No se encontró ningún cliente con "${block.input.cuit_o_nombre}" en el sistema.`;
+        } else if (result.exact) {
+          const c = result.clients[0];
+          content = `Cliente encontrado:\n• Razón social: ${c.name}\n• CUIT: ${c.tax_id || '(no registrado)'}\n• Teléfono: ${c.phone || '(no registrado)'}\n• Email: ${c.email || '(no registrado)'}\n• ID: ${c.id}`;
+        } else {
+          content = `Se encontraron ${result.clients.length} coincidencias:\n` +
+            result.clients.map((c, i) =>
+              `${i + 1}. ${c.name} | CUIT: ${c.tax_id || 'N/A'} | ID: ${c.id}`
+            ).join('\n') +
+            '\nPedile al cliente que confirme cuál es el correcto.';
+        }
+        toolResults.push({ type: 'tool_result', tool_use_id: block.id, content });
+        console.log(`[AI] buscar_cliente "${block.input.cuit_o_nombre}" → found: ${result.found}`);
+      }
+
+      else if (block.name === 'confirmar_cliente') {
         try {
-          orderData = createOrderFromAI(conv, block.input, productsMap);
+          const client = confirmarCliente(conv, block.input.client_id);
+          conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
           toolResults.push({
-            type:        'tool_result',
-            tool_use_id: block.id,
-            content:     `Pedido ${orderData.orderNumber} creado. Total: $${orderData.total.toFixed(2)}. Ítems: ${orderData.lines.map(l => `${l.qty} ${l.unit} de ${l.name} ($${l.subtotal.toFixed(2)})`).join(', ')}.`,
+            type: 'tool_result', tool_use_id: block.id,
+            content: `✅ Cliente confirmado y vinculado: ${client.name} (CUIT: ${client.tax_id || 'N/A'}, ID: ${client.id}). Podés continuar con el pedido.`,
           });
         } catch (err) {
-          toolResults.push({
-            type:        'tool_result',
-            tool_use_id: block.id,
-            content:     `Error al crear el pedido: ${err.message}`,
-            is_error:    true,
-          });
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true });
         }
       }
 
-      messages = [...messages, { role: 'user', content: toolResults }];
-
-      const followUp = await client.messages.create({
-        model:       'claude-opus-4-6',
-        max_tokens:  512,
-        system:      systemPrompt,
-        messages,
-        tools,
-        tool_choice: { type: 'none' },  // no volver a llamar herramientas
-      });
-
-      for (const block of followUp.content) {
-        if (block.type === 'text') { responseText = block.text; break; }
+      else if (block.name === 'crear_cliente') {
+        try {
+          const client = crearCliente(conv, block.input);
+          conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
+          toolResults.push({
+            type: 'tool_result', tool_use_id: block.id,
+            content: `✅ Cliente creado: ${client.name} (CUIT: ${client.tax_id}, ID: ${client.id}). Podés continuar con el pedido.`,
+          });
+        } catch (err) {
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true });
+        }
       }
-    } else {
-      for (const block of response.content) {
-        if (block.type === 'text') { responseText = block.text; break; }
+
+      else if (block.name === 'create_order') {
+        conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
+        try {
+          orderData = createOrderFromAI(conv, block.input, productsMap);
+          toolResults.push({
+            type: 'tool_result', tool_use_id: block.id,
+            content: `✅ Pedido ${orderData.orderNumber} creado para ${orderData.clientName}. Total: $${orderData.total.toFixed(2)}. Ítems: ${orderData.lines.map(l => `${l.qty} ${l.unit} de ${l.name} ($${l.subtotal.toFixed(2)})`).join(', ')}.`,
+          });
+        } catch (err) {
+          console.error('[AI] Error creando pedido:', err.message);
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error: ${err.message}`, is_error: true });
+        }
       }
     }
-  } catch (err) {
-    console.error('[AI] Error llamando API de Claude:', err.message);
-    console.error('[AI] Stack:', err.stack);
-    if (err.status) console.error('[AI] HTTP status:', err.status);
-    if (err.error)  console.error('[AI] API error body:', JSON.stringify(err.error));
-    return;
+
+    messages = [...messages, { role: 'user', content: toolResults }];
   }
 
-  console.log(`[AI] responseText obtenido: ${responseText ? `"${responseText.slice(0, 80)}..."` : 'null'}`);
   if (!responseText) return;
 
-  // ── Persistir respuesta ───────────────────────────────────────────────────
+  conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
   const msgRes = db.prepare(
     "INSERT INTO ai_messages (conversation_id, role, content) VALUES (?, 'assistant', ?)"
   ).run(convId, responseText);
@@ -260,17 +431,15 @@ async function processAIResponse(convId) {
 
   const savedMsg    = db.prepare('SELECT * FROM ai_messages WHERE id = ?').get(msgRes.lastInsertRowid);
   const updatedConv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(convId);
-
   broadcast({ type: 'new_message', conversation_id: convId, message: savedMsg, conversation: updatedConv });
 
-  // ── Enviar por WhatsApp si aplica ─────────────────────────────────────────
   if (conv.channel === 'whatsapp' && conv.phone_number && isConfigured()) {
     await sendTextMessage(conv.phone_number, responseText).catch(err =>
-      console.error('[AI→WA] Error enviando respuesta:', err.message)
+      console.error('[AI→WA] Error:', err.message)
     );
   }
 
-  console.log(`[AI] Respuesta generada para conv #${convId}${orderData ? ` — Pedido ${orderData.orderNumber} creado` : ''}`);
+  console.log(`[AI] Respuesta conv #${convId}${orderData ? ` — Pedido ${orderData.orderNumber} para ${orderData.clientName}` : ''}`);
 }
 
 module.exports = { processAIResponse };

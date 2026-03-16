@@ -101,13 +101,26 @@ async function handleIncomingMessage(message, contact) {
     // ── Crear nueva conversación ───────────────────────────────────
     const welcome = settings?.welcome_message || '¡Hola! ¿En qué puedo ayudarte?';
 
+    // Auto-vincular si el teléfono ya corresponde a un cliente registrado
+    const existingClient = db.prepare(
+      'SELECT id, name FROM clients WHERE phone = ? AND active = 1 LIMIT 1'
+    ).get(phoneNumber);
+
     const result = db.prepare(`
       INSERT INTO ai_conversations
-        (client_name, channel, status, ai_active, phone_number, last_message, last_message_at)
-      VALUES (?, 'whatsapp', 'active', 1, ?, ?, datetime('now'))
-    `).run(clientName, phoneNumber, text);
+        (client_id, client_name, channel, status, ai_active, phone_number, last_message, last_message_at)
+      VALUES (?, ?, 'whatsapp', 'active', 1, ?, ?, datetime('now'))
+    `).run(
+      existingClient?.id   || null,
+      existingClient?.name || clientName,
+      phoneNumber,
+      text
+    );
 
     conv = db.prepare('SELECT * FROM ai_conversations WHERE id = ?').get(result.lastInsertRowid);
+    if (existingClient) {
+      console.log(`[WhatsApp] Cliente reconocido: "${existingClient.name}" (ID: ${existingClient.id})`);
+    }
 
     // Guardar mensaje de bienvenida de la IA
     db.prepare(
